@@ -1,24 +1,51 @@
 # Strat-Sandbox
 
-Notebooks for building and backtesting classic technical trading strategies across FX, equities, and crypto.
+An FX toxic-flow detector: it measures adverse selection in a market-making book
+and runs a quoting gate that widens or pulls quotes when incoming flow looks
+informed. Research is done in Python; the latency-critical path is C++17.
 
-## Overview
+The repo also keeps a set of older technical-strategy notebooks (MA, MACD, RSI,
+Puell Multiple). Those are side experiments, not part of the main project. See
+[Notebooks](#notebooks).
 
-Each folder implements and tests a specific indicator or strategy, moving average crossovers, MACD, RSI, Bollinger Band variants, and the Puell Multiple (a Bitcoin on-chain valuation metric)  against real price data (tested so far on GBP/USD, SPY, and BTC) to see how they perform out of sample rather than just in theory.
+![Toxicity report](toxicity_report.png)
 
-## Contents
+## What it does
 
-- **Moving Average** — MA, MA crossover, and MACD strategies, including a Bollinger Band variant, backtested on GBP/USD and SPY
-- **Relative Strength Index** — RSI and RSI + Bollinger Band strategies
-- **Puell Multiple** — calculator for the Puell Multiple, used as a cyclical valuation signal for Bitcoin
+A nine-phase pipeline, run end to end by [src/run_pipeline.py](src/run_pipeline.py):
 
-## Approach
+1. **Ingest and clean**: load ticks from Dukascopy, duka, TrueFX or HistData, or
+   generate synthetic data. Drop crossed quotes and flag gaps.
+2. **Blotter**: load a fill blotter, or simulate one from the ticks (`lp`, `ma`
+   or `random` book).
+3. **VPIN and markouts**: streaming volume-bucketed VPIN with bulk volume
+   classification, LP markouts at several horizons, and an adverse-selection
+   decay curve fit (`alpha_mu`, `lambda`).
+4. **Labelling**: crossback, triple-barrier or markout-threshold toxicity labels.
+5. **Features**: pre-trade features (VPIN percentile, spread, realized vol, tick
+   rate, counterparty history, fractionally differenced series), followed by
+   forward feature selection scored on Brier skill.
+6. **Model**: a calibrated logistic regression or LightGBM classifier, trained
+   with purged cross-validation.
+7. **Integration**: a quoting gate with hysteresis and dwell. Its spread is
+   `2 · alpha_mu · P(toxic)`.
+8. **Export**: write the model to a `.fxm` file, which the C++ engine loads by
+   feature name.
+9. **Monitoring**: track drift and the value the gate adds.
 
-Each notebook pulls historical price data, computes the relevant indicator, defines entry/exit rules, and plots the resulting strategy performance against a buy-and-hold baseline.
+The run prints a verdict and writes four charts to `toxicity_report.png`.
 
-## Stack
+## Layout
 
-Python (Jupyter), pandas, NumPy, matplotlib.
+```
+include/fxtox/   header-only C++17 core: VPIN, markouts, labels, features, model, gate
+src/             Python pipeline, pybind11 bindings, realtime engine (vpin_realtime.cpp)
+tests/           C++ unit tests and the pytest suite (leakage, parity, VPIN, labels, ...)
+bench/           C++ vs NumPy timings
+Notebooks/       older technical-strategy notebooks (side experiments)
+```
+
+[docs_toxicity.md](docs_toxicity.md) has the module-by-module breakdown.
 
 ## Setup
 
@@ -26,12 +53,71 @@ Python (Jupyter), pandas, NumPy, matplotlib.
 git clone https://github.com/nucleartoby/Strat-Sandbox.git
 cd Strat-Sandbox
 pip install -r requirements.txt
-jupyter notebook
+
+# optional: build the C++ core. Without it, everything runs on the NumPy reference, just slower.
+brew install libomp                       # macOS, for LightGBM
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-## Notes
+The extension builds into `src/`, so `import fxtox_native` works without an
+install step.
 
-This is an exploratory sandbox rather than a production backtesting framework. Each notebook is self-contained, so results and assumptions (fees, slippage, position sizing) vary by strategy and are documented inline.
+## Usage
+
+```bash
+# synthetic data, all nine phases
+python src/run_pipeline.py
+
+# real EUR/USD from Dukascopy, simulated LP book, labels tuned for fast latency-arb bleed
+python src/run_pipeline.py --symbol EURUSD --start 2024-01-02 --end 2024-01-05 \
+       --simulate lp --label-rule markout_threshold --label-horizon 30
+
+# your own ticks and fills, exporting the trained model
+python src/run_pipeline.py --ticks EURUSD.csv --provider dukascopy \
+       --blotter fills.csv --export model.fxm
+
+# build a fill blotter on its own (writes my_fills.csv)
+python src/make_blotter.py --symbol EURUSD --start 2024-01-02 --end 2024-01-05 --mode lp
+
+# realtime engine: stream ticks through VPIN, features and the gate
+./build/vpin_realtime --bucket-volume 3e6 --model model.fxm < ticks.csv
+```
+
+A blotter CSV has the columns `timestamp,side,price,size,counterparty_id`.
+
+## Tests and performance
+
+```bash
+pytest tests/
+./build/fxtox_tests
+python bench/bench.py
+```
+
+The suite includes leakage tests, which check that truncating the tick stream
+at the last fill changes no feature. It also includes parity tests, which check
+that the research and live feature paths agree bit for bit.
+
+On 500k ticks and 20k fills (Apple M-series, `-O3 -march=native`), the C++
+core runs the full batch in about 36 ms, against about 200 ms for the
+vectorised NumPy reference. The realtime engine sustains about 29M ticks/s.
+[docs_toxicity.md](docs_toxicity.md) has the full table and the main design
+decisions: causality, the 0.5 VPIN noise floor, mid-centred barriers,
+`alpha_mu` pricing, and matching the label rule to the kind of toxicity.
+
+## Notebooks
+
+The `Notebooks/` folder holds earlier, self-contained experiments with classic
+technical strategies, backtested against buy-and-hold on GBP/USD, SPY and BTC.
+They don't share the pipeline's testing standards, and their assumptions (fees,
+slippage, sizing) vary from notebook to notebook.
+
+- **Moving Average**: MA, MA crossover and MACD strategies, including a
+  Bollinger Band variant
+- **Relative Strength Index**: RSI and RSI + Bollinger Band
+- **Puell Multiple**: a Bitcoin on-chain valuation metric
+
+Open them with `jupyter notebook`.
 
 ## License
 

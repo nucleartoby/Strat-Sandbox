@@ -8,7 +8,7 @@
 #include <limits>
 #include <vector>
 
-#include "fxtox/math.hpp"
+#include "fxtox/maths.hpp"
 #include "fxtox/types.hpp"
 
 namespace fxtox {

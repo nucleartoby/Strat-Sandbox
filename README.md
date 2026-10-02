@@ -4,10 +4,6 @@ An FX toxic-flow detector: it measures adverse selection in a market-making book
 and runs a quoting gate that widens or pulls quotes when incoming flow looks
 informed. Research is done in Python; the latency-critical path is C++17.
 
-The repo also keeps a set of older technical-strategy notebooks (MA, MACD, RSI,
-Puell Multiple). Those are side experiments, not part of the main project. See
-[Notebooks](#notebooks).
-
 ![Toxicity report](toxicity_report.png)
 
 ## What it does
@@ -34,18 +30,6 @@ A nine-phase pipeline, run end to end by [src/run_pipeline.py](src/run_pipeline.
 9. **Monitoring**: track drift and the value the gate adds.
 
 The run prints a verdict and writes four charts to `toxicity_report.png`.
-
-## Layout
-
-```
-include/fxtox/   header-only C++17 core: VPIN, markouts, labels, features, model, gate
-src/             Python pipeline, pybind11 bindings, realtime engine (vpin_realtime.cpp)
-tests/           C++ unit tests and the pytest suite (leakage, parity, VPIN, labels, ...)
-bench/           C++ vs NumPy timings
-Notebooks/       older technical-strategy notebooks (side experiments)
-```
-
-[docs_toxicity.md](docs_toxicity.md) has the module-by-module breakdown.
 
 ## Setup
 
@@ -85,39 +69,6 @@ python src/make_blotter.py --symbol EURUSD --start 2024-01-02 --end 2024-01-05 -
 ```
 
 A blotter CSV has the columns `timestamp,side,price,size,counterparty_id`.
-
-## Tests and performance
-
-```bash
-pytest tests/
-./build/fxtox_tests
-python bench/bench.py
-```
-
-The suite includes leakage tests, which check that truncating the tick stream
-at the last fill changes no feature. It also includes parity tests, which check
-that the research and live feature paths agree bit for bit.
-
-On 500k ticks and 20k fills (Apple M-series, `-O3 -march=native`), the C++
-core runs the full batch in about 36 ms, against about 200 ms for the
-vectorised NumPy reference. The realtime engine sustains about 29M ticks/s.
-[docs_toxicity.md](docs_toxicity.md) has the full table and the main design
-decisions: causality, the 0.5 VPIN noise floor, mid-centred barriers,
-`alpha_mu` pricing, and matching the label rule to the kind of toxicity.
-
-## Notebooks
-
-The `Notebooks/` folder holds earlier, self-contained experiments with classic
-technical strategies, backtested against buy-and-hold on GBP/USD, SPY and BTC.
-They don't share the pipeline's testing standards, and their assumptions (fees,
-slippage, sizing) vary from notebook to notebook.
-
-- **Moving Average**: MA, MA crossover and MACD strategies, including a
-  Bollinger Band variant
-- **Relative Strength Index**: RSI and RSI + Bollinger Band
-- **Puell Multiple**: a Bitcoin on-chain valuation metric
-
-Open them with `jupyter notebook`.
 
 ## License
 

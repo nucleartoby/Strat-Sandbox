@@ -46,9 +46,8 @@ inline double betacf(double a, double b, double x) noexcept {
         if (std::fabs(del - 1.0) < kEps) break;
     }
     return h;
-}
 
-// Regularized incomplete beta
+}
 inline double betai(double a, double b, double x) noexcept {
     if (x <= 0.0) return 0.0;
     if (x >= 1.0) return 1.0;
@@ -59,7 +58,6 @@ inline double betai(double a, double b, double x) noexcept {
 }
 
 }
-
 inline double student_t_cdf(double t, double df) noexcept {
     if (df <= 0.0) return norm_cdf(t);
     const double x = df / (df + t * t);

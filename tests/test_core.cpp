@@ -441,6 +441,25 @@ void test_counterparty_history_is_causal() {
     CHECK_CLOSE(rate[4], (3.0 + 1.0) / (3.0 + 2.0), 1e-12);
 }
 
+void test_counterparty_history_waits_for_label_horizon() {
+    // labels resolve 10 ns after each fill; fill 2 (t=5) must not see fill 0 (t=0)
+    std::vector<std::int32_t> cp{1, 1, 1, 1};
+    std::vector<std::int8_t> y{1, 1, 0, 0};
+    std::vector<nanos_t> ts{0, 4, 5, 14};
+    std::vector<double> px(cp.size(), 1.0), sz(cp.size(), 1.0);
+    std::vector<std::int8_t> side(cp.size(), 1);
+    FillView fv{ts.data(), px.data(), sz.data(), side.data(), cp.data(), cp.size()};
+
+    std::vector<double> rate(cp.size()), count(cp.size());
+    counterparty_history(fv, y.data(), 0.5, 2.0, rate.data(), count.data(), 10);
+
+    CHECK_CLOSE(count[1], 0.0, 1e-12);
+    CHECK_CLOSE(count[2], 0.0, 1e-12);
+    CHECK_CLOSE(rate[2], 0.5, 1e-12);
+    CHECK_CLOSE(count[3], 2.0, 1e-12); // t=0 and t=4 resolved by t=14; t=5 not yet
+    CHECK_CLOSE(rate[3], (2.0 + 1.0) / (2.0 + 2.0), 1e-12);
+}
+
 
 void write_names(std::FILE* f, const std::vector<std::string>& names) {
     const std::uint32_t n = static_cast<std::uint32_t>(names.size());
@@ -644,6 +663,7 @@ int main() {
     test_labeling_triple_barrier();
     test_feature_parity_batch_vs_live();
     test_counterparty_history_is_causal();
+    test_counterparty_history_waits_for_label_horizon();
     test_model_logistic();
     test_model_gbdt();
     test_model_rejects_garbage();

@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -309,17 +310,22 @@ PYBIND11_MODULE(fxtox_native, m) {
         "Pre-trade feature matrix, [n_fills x FEATURE_COUNT].");
 
     m.def("counterparty_history",
-        [](arr_i32 cp, arr_i8 labels, double prior_rate, double prior_weight) {
+        [](arr_i32 cp, arr_i8 labels, double prior_rate, double prior_weight,
+           py::object ts, double label_delay_sec) {
             const std::size_t n = static_cast<std::size_t>(cp.size());
             require(labels.size() == cp.size(),
                     "counterparty_history: length mismatch");
 
-            // Only the counterparty column is read from the fills
-            std::vector<nanos_t> dummy_ts(n, 0);
+            // Only the counterparty and timestamp columns are read from the fills
+            Keeper keep;
+            const nanos_t* ts_ptr = keep.take<arr_i64>(ts, n, "ts");
+            require(ts_ptr || label_delay_sec == 0.0,
+                    "counterparty_history: label_delay_sec needs ts");
+            std::vector<nanos_t> dummy_ts(ts_ptr ? 0 : n, 0);
             std::vector<double> dummy_px(n, 0.0);
             std::vector<std::int8_t> dummy_side(n, 1);
             FillView fv;
-            fv.ts = dummy_ts.data();
+            fv.ts = ts_ptr ? ts_ptr : dummy_ts.data();
             fv.price = dummy_px.data();
             fv.side = dummy_side.data();
             fv.counterparty = static_cast<const std::int32_t*>(cp.request().ptr);
@@ -331,13 +337,16 @@ PYBIND11_MODULE(fxtox_native, m) {
                 counterparty_history(fv, static_cast<const std::int8_t*>(labels.request().ptr),
                                      prior_rate, prior_weight,
                                      static_cast<double*>(rate.request().ptr),
-                                     static_cast<double*>(count.request().ptr));
+                                     static_cast<double*>(count.request().ptr),
+                                     static_cast<nanos_t>(std::llround(label_delay_sec * 1e9)));
             }
             return py::make_tuple(rate, count);
         },
         py::arg("counterparty"), py::arg("labels"), py::arg("prior_rate") = 0.5,
-        py::arg("prior_weight") = 5.0,
-        "Causal per-counterparty toxic rate and prior fill count.");
+        py::arg("prior_weight") = 5.0, py::arg("ts") = py::none(),
+        py::arg("label_delay_sec") = 0.0,
+        "Causal per-counterparty toxic rate and prior fill count. A fill's label "
+        "counts only from ts + label_delay_sec, when it would be known live.");
 
     py::class_<Model>(m, "Model")
         .def_static("load", &Model::load, py::arg("path"))

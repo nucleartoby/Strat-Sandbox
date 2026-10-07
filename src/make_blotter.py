@@ -57,6 +57,7 @@ def lp_blotter(ticks: pd.DataFrame, refresh_ticks: int = 40,
     
     pickoffs = pd.DataFrame(rows, columns=["timestamp", "side", "price", "size",
                                            "counterparty_id"])
+    pickoffs["is_informed"] = True
 
     n_benign = int(len(pickoffs) * benign_per_pickoff)
     if n_benign > 0:
@@ -70,7 +71,8 @@ def lp_blotter(ticks: pd.DataFrame, refresh_ticks: int = 40,
             "price": np.where(side == "buy", ticks["ask"].to_numpy()[idx],
                               ticks["bid"].to_numpy()[idx]),
             "size": rng.integers(1, 20, len(idx)) * 100_000.0,
-            "counterparty_id": [f"CP_{c:03d}" for c in cps],})
+            "counterparty_id": [f"CP_{c:03d}" for c in cps],
+            "is_informed": False,})
         return pd.concat([pickoffs, benign], ignore_index=True)
     return pickoffs
 

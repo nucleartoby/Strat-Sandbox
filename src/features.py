@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
@@ -21,6 +23,7 @@ def build_feature_matrix(fills: pd.DataFrame, ticks: pd.DataFrame,
                          short_window_sec: float = 60.0,
                          long_window_sec: float = 900.0,
                          cp_prior_rate: float = 0.5, cp_prior_weight: float = 5.0,
+                         label_delay_sec: float = 0.0,
                          use_native: bool = True) -> pd.DataFrame:
     fills = fills.sort_values("timestamp", kind="mergesort").reset_index(drop=True).copy()
     if labels is not None:
@@ -51,6 +54,8 @@ def build_feature_matrix(fills: pd.DataFrame, ticks: pd.DataFrame,
          else np.full(len(fills), native.LABEL_UNKNOWN, dtype=np.int8))
     rate, count = native.counterparty_history(cp_codes, y, prior_rate=cp_prior_rate,
                                               prior_weight=cp_prior_weight,
+                                              ts=fills["timestamp"],
+                                              label_delay_sec=label_delay_sec,
                                               use_native=use_native)
     fills["cp_toxic_rate_hist"] = rate
     fills["cp_fill_count"] = count
@@ -66,6 +71,17 @@ def _encode_counterparty(fills: pd.DataFrame) -> np.ndarray:
         return np.full(len(fills), -1, dtype=np.int32)
     codes = pd.Categorical(fills["counterparty_id"].astype(str)).codes
     return np.ascontiguousarray(codes, dtype=np.int32)
+
+
+def counterparty_table(fills: pd.DataFrame, labels: pd.Series) -> pd.DataFrame:
+    if "counterparty_id" not in fills:
+        return pd.DataFrame(columns=["counterparty", "code", "toxic", "total"])
+    y = np.asarray(labels)
+    df = pd.DataFrame({"counterparty": fills["counterparty_id"].astype(str).to_numpy(),
+                       "code": _encode_counterparty(fills), "y": y})
+    df = df[df["y"] >= 0]
+    return (df.groupby(["counterparty", "code"])["y"].agg(toxic="sum", total="size")
+              .reset_index().sort_values("code").reset_index(drop=True))
 
 
 def _session_from_seconds(sec_of_day: pd.Series) -> pd.Series:

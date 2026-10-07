@@ -33,6 +33,7 @@ struct Options {
     std::int32_t counterparty = -1;  // whose history to score against
     double base_spread = 0.0;        // 0 => use the live spread
     std::string model_path;
+    std::string cp_history_path;
     GateConfig gate;
     std::size_t bench = 0;
     bool quiet = false;
@@ -52,7 +53,9 @@ struct Options {
         "  --model PATH          .fxm classifier; without it the gate runs on\n"
         "                        the VPIN percentile directly\n"
         "  --quote-size X        notional the live feature vector assumes [1e6]\n"
-        "  --counterparty N      counterparty id to score against [-1]\n"
+        "  --counterparty N      counterparty code to score against [-1]\n"
+        "  --cp-history PATH     seed counterparty history from the pipeline's\n"
+        "                        .cp.csv (code,toxic,total columns)\n"
         "  --base-spread X       reference spread; 0 uses the live spread [0]\n"
         "  --alpha-mu X          adverse-selection cost from the markout fit [0]\n"
         "  --widen-above P       widen threshold [0.65]\n"
@@ -96,6 +99,9 @@ Options parse(int argc, char** argv) {
         } else if (a == "--model") {
             if (++i >= argc) usage(2);
             o.model_path = argv[i];
+        } else if (a == "--cp-history") {
+            if (++i >= argc) usage(2);
+            o.cp_history_path = argv[i];
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             usage(2);
@@ -168,6 +174,42 @@ bool map_header(const std::string& header, int* col) {
     return col[0] >= 0 && col[1] >= 0 && col[2] >= 0 && col[3] >= 0;
 }
 
+// Reads the code, toxic and total columns of the pipeline
+bool load_cp_history(const std::string& path, LiveCounterpartyHistory& h, std::size_t& n) {
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+    char buf[4096];
+    int c_code = -1, c_toxic = -1, c_total = -1;
+    bool header = true;
+    n = 0;
+    while (std::fgets(buf, sizeof buf, f)) {
+        std::vector<std::string> cells;
+        std::string cell;
+        for (const char* p = buf; *p && *p != '\n' && *p != '\r'; ++p) {
+            if (*p == ',') { cells.push_back(cell); cell.clear(); }
+            else cell += *p;
+        }
+        cells.push_back(cell);
+        if (header) {
+            for (int k = 0; k < static_cast<int>(cells.size()); ++k) {
+                if (cells[k] == "code") c_code = k;
+                else if (cells[k] == "toxic") c_toxic = k;
+                else if (cells[k] == "total") c_total = k;
+            }
+            header = false;
+            if (c_code < 0 || c_toxic < 0 || c_total < 0) { std::fclose(f); return false; }
+            continue;
+        }
+        const int need = std::max(c_code, std::max(c_toxic, c_total));
+        if (static_cast<int>(cells.size()) <= need) continue;
+        h.seed(static_cast<std::int32_t>(std::atoi(cells[c_code].c_str())),
+               std::atof(cells[c_toxic].c_str()), std::atof(cells[c_total].c_str()));
+        ++n;
+    }
+    std::fclose(f);
+    return true;
+}
+
 std::vector<Tick> synth(std::size_t n, std::uint64_t seed = 42) {
     std::mt19937_64 rng(seed);
     std::normal_distribution<double> gauss(0.0, 1.0);
@@ -235,6 +277,10 @@ int main(int argc, char** argv) {
     available.emplace_back("cp_toxic_rate_hist");
     available.emplace_back("cp_fill_count");
     available.emplace_back("size");
+    available.emplace_back("vpin");
+    available.emplace_back("vpin_pctile");
+    available.emplace_back("is_client_buy");
+    const std::size_t kIsClientBuy = available.size() - 1;
 
     std::vector<int> binding;
     if (model) {
@@ -252,6 +298,17 @@ int main(int argc, char** argv) {
     std::vector<double> pool(available.size(), 0.0);
     std::vector<double> fvec(model ? model->n_features() : 0, 0.0);
     LiveCounterpartyHistory cp_history;
+    if (!o.cp_history_path.empty()) {
+        std::size_t n_cp = 0;
+        if (!load_cp_history(o.cp_history_path, cp_history, n_cp)) {
+            std::fprintf(stderr, "could not read --cp-history %s (needs code,toxic,total "
+                                 "columns)\n", o.cp_history_path.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "counterparty history: %zu counterparties; code %d has "
+                             "rate %.3f over %.0f fills\n", n_cp, o.counterparty,
+                     cp_history.rate_for(o.counterparty), cp_history.fill_count(o.counterparty));
+    }
     std::uint64_t n_ticks = 0, n_buckets = 0, n_suspend = 0, n_widen = 0;
 
     auto process = [&](const Tick& t) {
@@ -267,10 +324,18 @@ int main(int argc, char** argv) {
                 pool[kFeatCount + 0] = cp_history.rate_for(o.counterparty);
                 pool[kFeatCount + 1] = cp_history.fill_count(o.counterparty);
                 pool[kFeatCount + 2] = o.quote_size;
+                pool[kFeatCount + 3] = r.vpin;
+                pool[kFeatCount + 4] = r.percentile;
 
-                for (std::size_t j = 0; j < binding.size(); ++j)
-                    fvec[j] = pool[static_cast<std::size_t>(binding[j])];
-                p = model->predict_proba(fvec.data());
+                p = 0.0;
+                for (double side : {1.0, 0.0}) {
+                    pool[kIsClientBuy] = side;
+                    for (std::size_t j = 0; j < binding.size(); ++j)
+                        fvec[j] = pool[static_cast<std::size_t>(binding[j])];
+                    const double q = model->predict_proba(fvec.data());
+                    if (std::isnan(q)) return;
+                    p = std::max(p, q);
+                }
             } else {
                 if (std::isnan(r.percentile)) return;
                 p = r.percentile;

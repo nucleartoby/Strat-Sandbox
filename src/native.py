@@ -1,14 +1,18 @@
+import importlib.util
 import os
 import sys
 import warnings
 import numpy as np
 import pandas as pd
-import _reference as ref
-import fxtox_native as _nat
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+import _reference as ref
+
+HAVE_NATIVE = importlib.util.find_spec("fxtox_native") is not None
+_nat = importlib.import_module("fxtox_native") if HAVE_NATIVE else None
 
 
 FEATURE_NAMES = ref.FEATURE_NAMES
@@ -158,12 +162,15 @@ def build_features(tick_ts, bid, ask, fill_ts, fill_size, bid_size=None,
 
 
 def counterparty_history(counterparty, labels, prior_rate=0.5, prior_weight=5.0,
-                         use_native=True):
+                         ts=None, label_delay_sec=0.0, use_native=True):
     cp = np.ascontiguousarray(np.asarray(counterparty), dtype=np.int32)
     y = np.ascontiguousarray(np.asarray(labels), dtype=np.int8)
+    ts = None if ts is None else _i64(ts)
     if use_native and HAVE_NATIVE:
-        return _nat.counterparty_history(cp, y, float(prior_rate), float(prior_weight))
-    return ref.reference_counterparty_history(cp, y, prior_rate, prior_weight)
+        return _nat.counterparty_history(cp, y, float(prior_rate), float(prior_weight),
+                                         ts=ts, label_delay_sec=float(label_delay_sec))
+    return ref.reference_counterparty_history(cp, y, prior_rate, prior_weight, ts,
+                                              int(round(label_delay_sec * NS_PER_SEC)))
 
 
 def load_model(path):

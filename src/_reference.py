@@ -291,18 +291,22 @@ def reference_features(tick_ts, bid, ask, fill_ts, fill_size, bid_size=None,
     return out
 
 
-def reference_counterparty_history(counterparty, labels, prior_rate=0.5, prior_weight=5.0):
+def reference_counterparty_history(counterparty, labels, prior_rate=0.5, prior_weight=5.0,
+                                   ts=None, label_delay_ns=0):
     cp = np.asarray(counterparty, np.int32)
     y = np.asarray(labels, np.int8)
+    ts = np.zeros(len(cp), np.int64) if ts is None else np.asarray(ts, np.int64)
     rate = np.empty(len(cp))
     count = np.empty(len(cp))
-    seen: dict[int, list[float]] = {}
+    seen: dict[int, tuple[float, float]] = {}
+    resolved = 0
     for i, c in enumerate(cp):
+        while resolved < i and ts[resolved] + label_delay_ns <= ts[i]:
+            if y[resolved] >= 0:
+                toxic, total = seen.get(int(cp[resolved]), (0.0, 0.0))
+                seen[int(cp[resolved])] = (toxic + float(y[resolved]), total + 1.0)
+            resolved += 1
         toxic, total = seen.get(int(c), (0.0, 0.0))
         rate[i] = (toxic + prior_rate * prior_weight) / (total + prior_weight)
         count[i] = total
-        if y[i] >= 0:  # update only after emitting and only for resolved fills
-            seen[int(c)] = (toxic + float(y[i]), total + 1.0)
-        else:
-            seen[int(c)] = (toxic, total)
     return rate, count

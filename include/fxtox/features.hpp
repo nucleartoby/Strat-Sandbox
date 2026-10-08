@@ -285,6 +285,12 @@ class LiveCounterpartyHistory {
         a.toxic += static_cast<double>(label);
     }
 
+    void seed(std::int32_t counterparty, double toxic, double total) {
+        Acc& a = acc_[counterparty];
+        a.toxic += toxic;
+        a.total += total;
+    }
+
     std::size_t counterparties() const noexcept { return acc_.size(); }
 
   private:
@@ -298,22 +304,27 @@ class LiveCounterpartyHistory {
 inline void counterparty_history(const FillView& fills,
                                  const std::int8_t* labels,
                                  double prior_rate, double prior_weight,
-                                 double* out_rate, double* out_count) {
+                                 double* out_rate, double* out_count,
+                                 nanos_t label_delay_ns = 0) {
     struct Acc { double toxic = 0.0; double total = 0.0; };
     const std::size_t n_fills = fills.n;
     std::unordered_map<std::int32_t, Acc> acc;
     acc.reserve(n_fills / 8 + 16);
 
+    std::size_t resolved = 0; // fills 0 resolved are folded into acc
     for (std::size_t i = 0; i < n_fills; ++i) {
-        Acc& a = acc[fills[i].counterparty];
+        while (resolved < i && fills.ts[resolved] + label_delay_ns <= fills.ts[i]) {
+            const std::int8_t y = labels ? labels[resolved] : static_cast<std::int8_t>(-1);
+            if (y >= 0) {
+                Acc& r = acc[fills[resolved].counterparty];
+                r.total += 1.0;
+                r.toxic += static_cast<double>(y);
+            }
+            ++resolved;
+        }
+        const Acc& a = acc[fills[i].counterparty];
         out_rate[i] = (a.toxic + prior_rate * prior_weight) / (a.total + prior_weight);
         out_count[i] = a.total;
-
-        const std::int8_t y = labels ? labels[i] : static_cast<std::int8_t>(-1);
-        if (y >= 0) {
-            a.total += 1.0;
-            a.toxic += static_cast<double>(y);
-        }
     }
 }
 

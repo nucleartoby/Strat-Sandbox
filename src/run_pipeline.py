@@ -13,13 +13,16 @@ from cv import assert_no_leakage, purged_kfold_splits, split_report, walk_forwar
 from data_cleaning import clean_ticks, coverage_report
 from data_ingestion import (generate_synthetic_ticks, generate_synthetic_trades,
                             load_tick_data, load_trade_blotter)
-from features import FEATURE_COLUMNS, build_feature_matrix, feature_health, select_matrix
+from features import (FEATURE_COLUMNS, build_feature_matrix, counterparty_table,
+                      feature_health, select_matrix)
 from integration import (gate_summary, meta_label_gate, required_spread, simulate_gate)
 from labeling import drop_undecidable, label_fills, label_report, suggest_theta
 from markouts import compute_markouts, fit_markout_curve, markout_summary, spread_vs_adverse_selection
+from evaluation import (choose_threshold, gate_scores, holdout_scores, holdout_split,
+                        hour_blocks)
 from model_export import export_model, verify_export
-from modeling import (cross_validate, feature_importance, forward_select,
-                      reliability_curve, summarize, univariate_scores)
+from modeling import (cross_validate, evaluate, feature_importance, forward_select,
+                      get_model, reliability_curve, summarize, univariate_scores)
 from monitoring import (monotonicity_score, pnl_by_toxicity_decile, should_retrain,
                         sweep_gate_thresholds)
 from report import charts as render_charts, build_summary, print_summary
@@ -27,6 +30,11 @@ from validation import validation_report
 from vpin import compute_vpin, suggest_bucket_volume
 
 HORIZONS = [1.0, 5.0, 30.0, 300.0, 1800.0]
+GATE_THRESHOLDS = np.round(np.arange(0.05, 0.96, 0.05), 2)
+
+
+def _span(ts: pd.Series) -> str:
+    return f"{ts.min():%Y-%m-%d %H:%M} -> {ts.max():%Y-%m-%d %H:%M}"
 
 
 def _nearest_markout_column(horizons, target):
@@ -39,7 +47,7 @@ VERBOSE = False
 
 def say(*a, **k):
     if VERBOSE:
-        say(*a, **k)
+        print(*a, **k)
 
 
 def banner(text: str) -> None:
@@ -92,6 +100,9 @@ def main(argv=None) -> int:
     ap.add_argument("--pip", type=float, default=1e-4,
                     help="pip size for reporting; 1e-2 for JPY crosses [1e-4]")
     ap.add_argument("--skip-validation", action="store_true")
+    ap.add_argument("--holdout", type=float, default=0.25,
+                    help="fraction of fills, the latest in time, held out from all "
+                         "selection and tuning and scored once at the end [0.25]")
     ap.add_argument("--no-select-features", dest="select_features",
                     action="store_false",
                     help="train on every feature instead of forward-selecting")
@@ -228,7 +239,8 @@ def main(argv=None) -> int:
     say(f"\n{len(fills):,} fills with resolved labels")
 
     banner("Phase 5 - pre-trade features")
-    feats = build_feature_matrix(fills, ticks, buckets, labels=labels)
+    feats = build_feature_matrix(fills, ticks, buckets, labels=labels,
+                                 label_delay_sec=label_horizon)
     X, y, fills_used = select_matrix(feats, labels, return_rows=True)
     if len(X) == 0:
         print("!! no usable rows: every fill has a missing feature. Check the "
@@ -239,30 +251,38 @@ def main(argv=None) -> int:
     say("\nfeature health:")
     say(feature_health(feats).to_string(index=False))
 
-    banner("Phase 6 - walk-forward and purged cross-validation")
+    banner("Phase 6 - model selection on the development period")
     event_times = fills_used["timestamp"]
+    dev, test = holdout_split(event_times, label_horizon, test_frac=args.holdout)
+    say(f"development {len(dev):,} fills ({_span(event_times.iloc[dev])})")
+    say(f"holdout     {len(test):,} fills ({_span(event_times.iloc[test])}), "
+        f"untouched until Phase 7")
+    Xd, yd = X.iloc[dev].reset_index(drop=True), y.iloc[dev].reset_index(drop=True)
+    dev_times = event_times.iloc[dev].reset_index(drop=True)
+    fills_dev = fills_used.iloc[dev].reset_index(drop=True)
     for name, splits in (
-        ("purged k-fold", list(purged_kfold_splits(event_times, label_horizon,
+        ("purged k-fold", list(purged_kfold_splits(dev_times, label_horizon,
                                                    n_splits=5, embargo_frac=0.01))),
-        ("walk-forward", list(walk_forward_splits(event_times, label_horizon,
+        ("walk-forward", list(walk_forward_splits(dev_times, label_horizon,
                                                   n_splits=4))),):
-        assert_no_leakage(splits, event_times, label_horizon)
+        assert_no_leakage(splits, dev_times, label_horizon)
         say(f"\n{name} ({len(splits)} folds, leakage check passed):")
-        say(split_report(splits, event_times, y)[
+        say(split_report(splits, dev_times, yd)[
             ["fold", "n_train", "n_test", "test_toxic_rate"]].to_string(index=False))
 
-    splits = list(walk_forward_splits(event_times, label_horizon, n_splits=4))
+    splits = list(walk_forward_splits(dev_times, label_horizon, n_splits=4))
 
     say("\nunivariate feature scores (top 6):")
-    say(univariate_scores(X, y, splits).head(6).to_string(index=False))
+    say(univariate_scores(Xd, yd, splits).head(6).to_string(index=False))
 
+    cols = list(X.columns)
     if args.select_features:
         say("\nforward selection:")
-        sel = forward_select(X, y, splits, verbose=VERBOSE)
+        sel = forward_select(Xd, yd, splits, verbose=VERBOSE)
         if sel["selected"]:
             say(f"selected {len(sel['selected'])}/{X.shape[1]}: {sel['selected']}")
             say(f"dropped: {sel['dropped']}")
-            X = X[sel["selected"]]
+            cols = sel["selected"]
         else:
             print("NO feature beats simply predicting the base rate.")
             say("  Most often this means the blotter has no counterparty ids, so the "
@@ -272,7 +292,7 @@ def main(argv=None) -> int:
 
     results = {}
     for kind in dict.fromkeys(["logreg", args.model]):
-        res = cross_validate(X, y, splits, kind=kind)
+        res = cross_validate(Xd[cols], yd, splits, kind=kind)
         results[kind] = res
         say(f"\n--- {kind} ---")
         say(res["fold_results"][
@@ -282,77 +302,169 @@ def main(argv=None) -> int:
     best = args.model if args.model in results else "logreg"
     res = results[best]
     say(f"\nselected: {best}")
-    say("\nreliability (out-of-fold):")
+    say("\nreliability (development out-of-fold):")
     oof = res["oof_proba"]
-    mask = oof.notna()
-    say(reliability_curve(y[mask], oof[mask]).to_string(index=False))
+    scored = oof.notna().to_numpy()
+    say(reliability_curve(yd[scored], oof[scored]).to_string(index=False))
     say("\ntop features:")
     say(feature_importance(res).head(8).to_string(index=False))
 
-    banner("Phase 7 - integration")
-    proba = oof.fillna(oof.mean())
-    meta = meta_label_gate(pd.Series(1, index=X.index), proba, act_threshold=0.5)
-    say(f"meta-label gate: acts on {meta['act'].mean():.1%} of fills, "
+    pnl_col = _nearest_markout_column(horizons, label_horizon)
+    dev_sweep = sweep_gate_thresholds(fills_dev.loc[scored], oof[scored].to_numpy(),
+                                      thresholds=GATE_THRESHOLDS, pnl_column=pnl_col)
+    threshold = choose_threshold(dev_sweep)
+    say("\ngate threshold (chosen on development out-of-fold predictions): "
+        + (f"block at p>={threshold:.2f}" if threshold is not None
+           else "none improves PnL"))
+
+    banner("Phase 7 - untouched holdout")
+    model = res["model"]  # fit on the whole development period
+    fills_test = fills_used.iloc[test].reset_index(drop=True)
+    y_test = y.iloc[test].to_numpy()
+    p_test = model.predict_proba(X.iloc[test][cols])[:, 1]
+    blocks = hour_blocks(fills_test["timestamp"])
+    ho = holdout_scores(y_test, p_test, blocks)
+    fit_auc = evaluate(yd, model.predict_proba(Xd[cols])[:, 1])["auc"]
+    oof_auc = res["oof_metrics"].get("auc", np.nan)
+    say("AUC by stage (a large drop from in-sample to holdout means overfitting):")
+    say(f"  in-sample (development fit)  {fit_auc:.3f}")
+    say(f"  development out-of-fold      {oof_auc:.3f}")
+    say(f"  holdout                      {ho['auc']:.3f}  "
+        f"95% CI [{ho['auc_ci'][0]:.3f}, {ho['auc_ci'][1]:.3f}]")
+    say(f"holdout Brier skill {ho['brier_skill']:+.4f}  "
+        f"95% CI [{ho['brier_skill_ci'][0]:+.4f}, {ho['brier_skill_ci'][1]:+.4f}]")
+
+    baselines = [("base rate (development)", np.full(len(y_test), yd.mean()))]
+    if "cp_toxic_rate_hist" in X:
+        baselines.append(("counterparty history alone",
+                          X.iloc[test]["cp_toxic_rate_hist"].to_numpy()))
+    if best != "logreg":
+        baselines.append(("logreg, same features",
+                          results["logreg"]["model"].predict_proba(X.iloc[test][cols])[:, 1]))
+    baselines.append((f"{best} (selected)", p_test))
+    say("\nholdout vs baselines:")
+    say(pd.DataFrame([{"model": name, **{k: evaluate(y_test, p)[k]
+                                         for k in ("auc", "brier_skill", "log_loss")}}
+                      for name, p in baselines]).to_string(index=False))
+
+    rng = np.random.default_rng(0)
+    labels_perm = pd.Series(rng.permutation(labels.to_numpy()), index=labels.index)
+    Xp, yp = select_matrix(build_feature_matrix(fills, ticks, buckets, labels=labels_perm,
+                                                label_delay_sec=label_horizon), labels_perm)
+    perm_model = get_model(best).fit(Xp.iloc[dev][cols], yp.iloc[dev])
+    shuffle_auc = evaluate(yp.iloc[test].to_numpy(),
+                           perm_model.predict_proba(Xp.iloc[test][cols])[:, 1])["auc"]
+    say(f"\nshuffled-label check: holdout AUC {shuffle_auc:.3f} (want ~0.5)")
+
+    say("\nreliability (holdout):")
+    say(reliability_curve(y_test, p_test).to_string(index=False))
+
+    gate = None
+    if threshold is not None:
+        gate = gate_scores(fills_test[pnl_col].to_numpy(), p_test, threshold, blocks)
+        say(f"\nholdout gate at p>={threshold:.2f}: blocks {gate['blocked_share']:.1%} "
+            f"of fills, PnL {gate['uplift']:+.1%} "
+            f"(95% CI [{gate['uplift_ci'][0]:+.1%}, {gate['uplift_ci'][1]:+.1%}])")
+        say(f"  mean markout of blocked fills {gate['mean_pnl_blocked'] / args.pip:+.3f} pips, "
+            f"kept {gate['mean_pnl_kept'] / args.pip:+.3f} pips")
+        say("  same gate judged at every markout horizon:")
+        for h in horizons:
+            c = _nearest_markout_column(horizons, h)
+            g = gate_scores(fills_test[c].to_numpy(), p_test, threshold, blocks)
+            say(f"    {c:<16}PnL {g['uplift']:+7.1%}  "
+                f"95% CI [{g['uplift_ci'][0]:+.1%}, {g['uplift_ci'][1]:+.1%}]")
+
+    problems = []
+    if not ho["auc_ci"][0] > 0.5:
+        problems.append("holdout AUC is not distinguishable from chance")
+    if fit_auc - ho["auc"] > 0.05:
+        problems.append(f"in-sample AUC exceeds holdout by {fit_auc - ho['auc']:.3f}: overfitting")
+    if shuffle_auc > 0.55:
+        problems.append(f"shuffled labels still score AUC {shuffle_auc:.3f}: leakage")
+    if gate is not None and not gate["uplift_ci"][0] > 0:
+        problems.append("the gate's holdout PnL gain is not significant")
+    for p in problems:
+        say(f"!! {p}")
+    if not problems:
+        say("\nno overfitting or leakage detected on the holdout")
+
+    banner("Phase 8 - integration and export")
+    p_test_s = pd.Series(p_test)
+    meta = meta_label_gate(pd.Series(1, index=p_test_s.index), p_test_s, act_threshold=0.5)
+    say(f"meta-label gate (holdout): acts on {meta['act'].mean():.1%} of fills, "
           f"mean size multiplier {meta['size_multiplier'].mean():.2f}")
     say(f"required spread at p=0.8: {required_spread(0.8, fit['alpha_mu']):.3e} "
           f"(alpha_mu-priced)")
 
-    sim = simulate_gate(fills_used["timestamp"], proba,
-                        fills_used["spread"].to_numpy(), alpha_mu=fit["alpha_mu"])
+    # One gate per counterparty
+    gate_cfg = (dict(widen_above=threshold, suspend_above=threshold, tighten_below=0.0)
+                if threshold is not None else {})
+    groups = (fills_test.groupby("counterparty_id").indices.values()
+              if "counterparty_id" in fills_test else [np.arange(len(fills_test))])
+    sim = pd.concat([simulate_gate(fills_test["timestamp"].iloc[idx], p_test[idx],
+                                   fills_test["spread"].to_numpy()[idx],
+                                   alpha_mu=fit["alpha_mu"], **gate_cfg)
+                     for idx in groups], ignore_index=True)
     summary = gate_summary(sim)
-    say("\nlive gate simulation:")
+    say("\nlive gate simulation (holdout, one gate per counterparty):")
     say(summary[["action", "n", "share", "mean_proba", "mean_multiplier"]].to_string(index=False))
     say(f"state changes: {summary.attrs['state_changes']} "
           f"({summary.attrs['changes_per_1k']:.1f} per 1k fills)")
 
-    banner("Phase 8 - export for the C++ engine")
+    engine_gate = (f"--widen-above {threshold:.2f} --suspend-above {threshold:.2f} "
+                   f"--tighten-below 0" if threshold is not None else "")
     if args.export:
-        info = export_model(res["model"], args.export, feature_names=list(X.columns))
-        check = verify_export(res["model"], args.export, X.to_numpy())
-        say(f"exported {info['kind']} to {args.export} "
+        final = get_model(best).fit(X[cols], y)
+        info = export_model(final, args.export, feature_names=cols)
+        check = verify_export(final, args.export, X[cols].to_numpy())
+        say(f"\nexported {info['kind']} (refit on all {len(X):,} fills) to {args.export} "
               f"({os.path.getsize(args.export):,} bytes)")
         say(f"python vs C++ inference: max|diff| = {check['max_abs_diff']:.3e} "
               f"-> {'MATCH' if check['matches'] else 'MISMATCH'}")
         if not check["matches"]:
             print("!! export does not reproduce the Python model; do not deploy it")
             return 1
+        cp_path = os.path.splitext(args.export)[0] + ".cp.csv"
+        cp_table = counterparty_table(fills, labels)
+        cp_table.to_csv(cp_path, index=False)
+        say(f"counterparty history ({len(cp_table)} counterparties) -> {cp_path}")
+        say("run the engine for one counterparty (code column in that file):")
+        say(f"  ./build/vpin_realtime --bucket-volume {bucket_volume:.0f} --dist t "
+            f"--model {args.export} --cp-history {cp_path} --counterparty CODE "
+            f"{engine_gate} < ticks.csv")
     else:
-        say("pass --export PATH.fxm to write a model for the realtime engine")
-        say("then:  ./build/vpin_realtime --bucket-volume "
-              f"{bucket_volume:.0f} --model PATH.fxm --alpha-mu {fit['alpha_mu']:.3e} "
-              "< ticks.csv")
+        say("\npass --export PATH.fxm to write a model for the realtime engine")
 
-    banner("Phase 9 - monitoring")
-    pnl_col = _nearest_markout_column(horizons, label_horizon)
-    deciles = pnl_by_toxicity_decile(fills_used, proba, pnl_column=pnl_col)
+    banner("Phase 9 - monitoring (holdout)")
+    deciles = pnl_by_toxicity_decile(fills_test, p_test, pnl_column=pnl_col)
     say("realized markout by predicted-toxicity decile:")
     say(deciles[["decile", "n", "mean_proba", "mean_pnl"]].to_string(index=False))
     mono = monotonicity_score(deciles)
     say(f"\nmonotonicity (want close to -1): {mono:+.3f}")
 
-    say("\ngate value by threshold:")
-    sweep = sweep_gate_thresholds(fills_used, proba, pnl_column=pnl_col)
+    say("\ngate value by threshold (for reference; the threshold was fixed in Phase 6):")
+    sweep = sweep_gate_thresholds(fills_test, p_test, thresholds=GATE_THRESHOLDS,
+                                  pnl_column=pnl_col)
     say(sweep[["threshold", "blocked_share", "pnl_ungated", "pnl_gated",
                  "pnl_improvement"]].to_string(index=False))
 
-    trigger = should_retrain(res["fold_results"])
+    trigger = should_retrain(pd.DataFrame([ho]))
     say(f"\nretrain trigger: {trigger['retrain']} ({trigger['reason']})")
 
     banner("done")
 
-    pnl_col = _nearest_markout_column(horizons, label_horizon)
     summary = build_summary(
         symbol=args.symbol or os.path.basename(args.ticks or "synthetic"),
         ticks=ticks, fills=fills_used, labels=y, fit=fit, econ=econ,
         cv_result=res, deciles=deciles, sweep=sweep,
         monotonicity=mono, horizons=horizons, label_horizon=label_horizon,
-        pip=args.pip)
+        pip=args.pip, holdout=ho, gate=gate, problems=problems)
     print_summary(summary)
 
     if args.charts:
         path = render_charts(path=args.charts, summary=summary, fills=fills_used,
                              buckets=buckets, deciles=deciles, sweep=sweep,
-                             fit=fit, horizons=horizons, oof_proba=proba)
+                             fit=fit, horizons=horizons, oof_proba=p_test_s)
         print(f"  charts -> {path}")
     if not VERBOSE:
         print("  full diagnostics: re-run with -v")
